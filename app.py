@@ -1,407 +1,302 @@
+"""
+FreeFire Player Info API — OB55 (JWT-only)
+All auth via JWT API. No uid/password backup path.
+"""
+
 import asyncio
+import logging
+import sys
 import time
+from datetime import datetime, timedelta
+from typing import Optional
+
 import httpx
 import json
-import sys
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-import base64
-from datetime import datetime, timedelta
 from google.protobuf import json_format
 
-# ============= সব ফাইল একই ফোল্ডারে =============
+# ============= Proto imports =============
 try:
-    import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
-    import GetOutfit_pb2
+    import main_pb2, AccountPersonalShow_pb2
     print("✅ Proto files imported successfully")
 except ImportError as e:
     print(f"❌ Proto import error: {e}")
     sys.exit(1)
 
-# =============================================
-# CONFIG
-# =============================================
+# ============= Logging =============
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("ff-api")
 
+# ============= Config =============
 RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 14; CPH2095 Build/RKQ1.211119.001)"
 
-MAIN_KEY = b'Yg&tc%DEuh6%Zc^8'
-MAIN_IV = b'6oyZDr22E3ychjM%'
-
-# =============================================
-# JWT TOKEN API
-# =============================================
-
-JWT_API_BASE = "https://najmiob55jwttokengen.vercel.app/token"   #JWT API BY JAHID X EMPIRE 
-
-# =============================================
-# ACCOUNTS FOR JWT
-# =============================================
-
-BD_CREDS = {
-    "uid": "8443537397", 
-    "password": "Dark_8558DC24CD8D"
-}
-
-IND_CREDS = {
-    "uid": "7949920781", 
-    "password": "9E6B0D1620CF285C79D9704F9CD6B11D424530386557F1CFB0A5390DE93A3016"
-}
-
-BR_CREDS = {
-    "uid": "7810756496",
-    "password": "507D3250C779A4E73A74B66998E99DD4ED95A6133A07151FC0411A225C405ADD"
-}
-
-ACCOUNT_CREDENTIALS = {
-    "BD": BD_CREDS,
-    "IND": IND_CREDS,
-    "BR": BR_CREDS
-}
-
-# =============================================
-# 🌍 রিজন কনফিগ
-# =============================================
+JWT_API_BASE = "https://najmiob55jwttokengen.vercel.app/token"  # JWT API BY JAHID X EMPIRE
 
 REGION_CONFIG = {
-    "BD": {"server_url": "https://clientbp.ppmainecoonghj.com", "release_version": "OB55"},
-    "IND": {"server_url": "https://client.ind.freefiremobile.com", "release_version": "OB55"},
-    "BR": {"server_url": "https://client.us.freefiremobile.com", "release_version": "OB55"}
+    "BD":  {"server_url": "https://clientbp.ppmainecoonghj.com",      "release_version": "OB55"},
+    "IND": {"server_url": "https://client.ind.freefiremobile.com",    "release_version": "OB55"},
+    "BR":  {"server_url": "https://client.us.freefiremobile.com",     "release_version": "OB55"},
 }
-
-LOGIN_URLS = {
-    "BD": "https://loginbp.ppmainecoonghj.com",
-    "IND": "https://loginbp.ppmainecoonghj.com",
-    "BR": "https://loginbp.ppmainecoonghj.com"
-}
-
 
 REGION_PRIORITY = ["BD", "IND", "BR"]
 
-# === Flask App ===
+DEFAULT_REGION = "BD"
+
+TOKEN_TTL = 25200               # 7 hours
+JWT_FETCH_TIMEOUT = 10.0
+FF_REQUEST_TIMEOUT = 15.0
+JWT_FETCH_RETRIES = 3
+
+# ============= App =============
 app = Flask(__name__)
 CORS(app)
 
-# =============================================
-# In-Memory Token Cache (per container)
-# =============================================
+START_TIME = time.time()
 
-_token_cache = {}
+# ============= Token cache =============
+_token_cache: dict[str, dict] = {}
 
-# =============================================
-# JWT Token Function
-# =============================================
-
-async def get_jwt_token_from_api(region: str):
-    cred = ACCOUNT_CREDENTIALS.get(region)
-    if not cred:
-        return None
-
-    url = f"{JWT_API_BASE}?uid={cred['uid']}&password={cred['password']}"
-    
+# ============= JWT Fetch =============
+async def _fetch_jwt_once(region: str, client: httpx.AsyncClient) -> Optional[dict]:
+    """
+    One JWT API request. Returns token dict or None.
+    The JWT API takes region implicitly via endpoint (uid/pass baked into API key).
+    Here we pass region as a hint only — the API decides.
+    """
+    params = {"region": region}
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, headers=headers)
-            
-            if response.status_code != 200:
-                return None
-
-            data = response.json()
-            token = data.get("token")
-            if not token:
-                return None
-
-            api_region = data.get("region", region)
-            server_url = REGION_CONFIG.get(api_region, REGION_CONFIG["BD"])["server_url"]
-
-            return {
-                "token": f"Bearer {token}",
-                "region": api_region,
-                "server_url": server_url,
-                "expires_at": time.time() + 25200
-            }
-    except Exception as e:
-        print(f"❌ JWT API exception for {region}: {e}")
+        resp = await client.get(
+            JWT_API_BASE, params=params, headers=headers,
+            timeout=JWT_FETCH_TIMEOUT,
+        )
+    except httpx.HTTPError as e:
+        log.warning("JWT fetch transport error [%s]: %s", region, e)
         return None
 
-# =============================================
-# Token Getter (with cache)
-# =============================================
+    if resp.status_code != 200:
+        log.warning("JWT fetch non-200 [%s]: %s", region, resp.status_code)
+        return None
 
-async def get_token(region: str):
-    cached = _token_cache.get(region)
-    if cached and cached.get('expires_at', 0) > time.time():
-        return cached
+    try:
+        data = resp.json()
+    except Exception as e:
+        log.warning("JWT fetch bad JSON [%s]: %s", region, e)
+        return None
 
-    token_info = await get_jwt_token_from_api(region)
+    token = data.get("token")
+    if not token:
+        log.warning("JWT fetch missing token [%s]", region)
+        return None
 
-    if not token_info:
-        token_info = await generate_token_backup(region)
+    api_region = data.get("region") or region
+    cfg = REGION_CONFIG.get(api_region, REGION_CONFIG[DEFAULT_REGION])
 
-    if token_info:
-        _token_cache[region] = token_info
-        return token_info
+    return {
+        "token": f"Bearer {token}",
+        "region": api_region,
+        "server_url": cfg["server_url"],
+        "release_version": cfg["release_version"],
+        "expires_at": time.time() + TOKEN_TTL,
+    }
 
+async def _fetch_jwt_with_retry(region: str) -> Optional[dict]:
+    """JWT fetch with exponential backoff."""
+    async with httpx.AsyncClient() as client:
+        for attempt in range(JWT_FETCH_RETRIES):
+            result = await _fetch_jwt_once(region, client)
+            if result:
+                return result
+            if attempt < JWT_FETCH_RETRIES - 1:
+                await asyncio.sleep(0.5 * (2 ** attempt))
     return None
 
-async def generate_token_backup(region: str):
-    try:
-        cred = ACCOUNT_CREDENTIALS.get(region, ACCOUNT_CREDENTIALS["BD"])
-        account = f"uid={cred['uid']}&password={cred['password']}"
+async def get_token(region: str) -> Optional[dict]:
+    """Cache-first token getter."""
+    cached = _token_cache.get(region)
+    if cached and cached["expires_at"] > time.time() + 60:  # 60s safety margin
+        return cached
 
-        token_val, open_id = await get_access_token(account)
-        if not token_val or not open_id:
-            return None
+    fresh = await _fetch_jwt_with_retry(region)
+    if fresh:
+        _token_cache[region] = fresh
+    return fresh
 
-        body = json.dumps({
-            "open_id": open_id,
-            "open_id_type": "4",
-            "login_token": token_val,
-            "orign_platform_type": "4"
-        })
-        proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
-        payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
+def invalidate_token(region: str) -> None:
+    _token_cache.pop(region, None)
 
-        config = REGION_CONFIG.get(region, REGION_CONFIG["BD"])
-        login_url = LOGIN_URLS.get(region, LOGIN_URLS["BD"])
-        url = f"{login_url}/MajorLogin"
+# ============= AES helpers =============
+from Crypto.Cipher import AES
 
-        headers = {
-            'User-Agent': USERAGENT,
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Content-Type': "application/octet-stream",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': config['release_version']
-        }
+MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
+MAIN_IV  = b"6oyZDr22E3ychjM%"
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(url, data=payload, headers=headers)
-            if resp.status_code != 200:
-                return None
-
-            login_res = FreeFire_pb2.LoginRes()
-            login_res.ParseFromString(resp.content)
-            msg_json = json_format.MessageToJson(login_res)
-            msg = json.loads(msg_json)
-
-            return {
-                'token': f"Bearer {msg.get('token','0')}",
-                'region': msg.get('lockRegion','0'),
-                'server_url': msg.get('serverUrl','0'),
-                'expires_at': time.time() + 25200
-            }
-    except Exception as e:
-        print(f"❌ Backup token error for {region}: {e}")
-        return None
-
-# === Helper Functions ===
-def pad(text: bytes) -> bytes:
-    padding_length = AES.block_size - (len(text) % AES.block_size)
-    return text + bytes([padding_length] * padding_length)
+def _pad(data: bytes) -> bytes:
+    n = AES.block_size - (len(data) % AES.block_size)
+    return data + bytes([n] * n)
 
 def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return cipher.encrypt(pad(plaintext))
+    return AES.new(key, AES.MODE_CBC, iv).encrypt(_pad(plaintext))
 
-async def json_to_proto(json_data: str, proto_message) -> bytes:
-    json_format.ParseDict(json.loads(json_data), proto_message)
-    return proto_message.SerializeToString()
+def _serialize(json_dict: dict, proto_msg) -> bytes:
+    json_format.ParseDict(json_dict, proto_msg)
+    return proto_msg.SerializeToString()
 
-async def get_access_token(account: str):
-    url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
-    payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
-    headers = {'User-Agent': USERAGENT, 'Content-Type': "application/x-www-form-urlencoded"}
-
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(url, data=payload, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("access_token"), data.get("open_id")
-                await asyncio.sleep(1)
-        except:
-            await asyncio.sleep(1)
-    return None, None
-
-async def GetAccountInformation(uid, region):
-    try:
-        token_info = await get_token(region)
-        if not token_info:
-            return None
-
-        actual_region = token_info.get('region', region)
-        token = token_info['token']
-        server_url = token_info['server_url']
-        config = REGION_CONFIG.get(actual_region, REGION_CONFIG["BD"])
-
-        payload = await json_to_proto(json.dumps({'a': uid, 'b': '7'}), main_pb2.GetPlayerPersonalShow())
-        data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
-
-        headers = {
-            'User-Agent': USERAGENT,
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Content-Type': "application/octet-stream",
-            'Authorization': token,
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': config['release_version']
-        }
-
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(server_url + '/GetPlayerPersonalShow', data=data_enc, headers=headers)
-
-            if resp.status_code != 200:
-                return None
-
-            account_info = AccountPersonalShow_pb2.AccountPersonalShowInfo()
-            account_info.ParseFromString(resp.content)
-            result = json.loads(json_format.MessageToJson(account_info))
-
-            is_banned = result.get("isBanned", False)
-            if isinstance(is_banned, bool):
-                result["ban_status"] = "🔴 BANNED" if is_banned else "🟢 UNBANNED"
-            else:
-                result["ban_status"] = "❓ UNKNOWN"
-
-            result["region"] = actual_region
-            return result
-
-    except Exception as e:
+# ============= Core API call =============
+async def _call_player_show(uid: int, region: str) -> Optional[dict]:
+    """Single attempt against one region."""
+    token_info = await get_token(region)
+    if not token_info:
         return None
 
-# =============================================
-# HELPER
-# =============================================
+    actual_region = token_info["region"]
+    token = token_info["token"]
+    server_url = token_info["server_url"]
 
-def get_item_name(item_id):
-    if not item_id or item_id == "0" or item_id == 0:
-        return "N/A"
-    try:
-        import requests
-        response = requests.get(f"https://api.danger.workers.dev/item/{item_id}", timeout=3)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("name", str(item_id))
-        return str(item_id)
-    except:
-        return str(item_id)
+    payload = _serialize({"a": uid, "b": "7"}, main_pb2.GetPlayerPersonalShow())
+    enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, payload)
 
-def get_rank_name(rp):
-    try:
-        rp = int(rp)
-    except:
-        return "N/A"
-    if rp == 0: return "Bronze I"
-    if rp < 100: return "Bronze II"
-    if rp < 200: return "Bronze III"
-    if rp < 300: return "Silver I"
-    if rp < 400: return "Silver II"
-    if rp < 500: return "Silver III"
-    if rp < 600: return "Gold I"
-    if rp < 700: return "Gold II"
-    if rp < 800: return "Gold III"
-    if rp < 900: return "Platinum I"
-    if rp < 1000: return "Platinum II"
-    if rp < 1100: return "Platinum III"
-    if rp < 1200: return "Diamond I"
-    if rp < 1300: return "Diamond II"
-    if rp < 1400: return "Diamond III"
-    if rp < 1500: return "Heroic"
-    if rp < 2000: return "Master"
-    return "Grandmaster"
-
-def ts_to_bst(ts):
-    try:
-        dt = datetime.fromtimestamp(int(ts)) + timedelta(hours=6)
-        return dt.strftime("%d %b %Y at %I:%M:%S %p") + " (BST)"
-    except:
-        return "N/A"
-
-# =============================================
-# MAIN API
-# =============================================
-
-@app.route('/info')
-def get_full_info():
-    uid = request.args.get('uid')
-
-    if not uid:
-        return jsonify({"error": "UID required"}), 400
+    headers = {
+        "User-Agent": USERAGENT,
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/octet-stream",
+        "Authorization": token,
+        "X-Unity-Version": "2018.4.11f1",
+        "X-GA": "v1 1",
+        "ReleaseVersion": token_info["release_version"],
+    }
 
     try:
-        uid_int = int(uid)
-    except:
-        return jsonify({"error": "Invalid UID"}), 400
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{server_url}/GetPlayerPersonalShow",
+                content=enc, headers=headers, timeout=FF_REQUEST_TIMEOUT,
+            )
+    except httpx.HTTPError as e:
+        log.warning("FF request transport error [%s]: %s", region, e)
+        return None
 
-    async def try_all_regions_parallel():
-        """BD, IND, BR — FULL MADE BY @Jahid_x_Empire IF CHANGE ANY CREDIT == YOU ARE A GAY  ।"""
-        tasks = []
-        for region in REGION_PRIORITY:
-            tasks.append(asyncio.create_task(GetAccountInformation(uid_int, region)))
-        
-        try:
-            for coro in asyncio.as_completed(tasks, timeout=20):
-                try:
-                    data = await coro
-                    if data:
-                        # বাকি টাস্ক ক্যান্সেল
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
-                        return data
-                except Exception:
-                    continue
-        except asyncio.TimeoutError:
-            pass
-        
+    if resp.status_code in (401, 403):
+        # Token dead — nuke it, let next call refresh
+        invalidate_token(region)
+        return None
+
+    if resp.status_code != 200:
+        log.warning("FF request non-200 [%s]: %s", region, resp.status_code)
+        return None
+
+    info = AccountPersonalShow_pb2.AccountPersonalShowInfo()
+    info.ParseFromString(resp.content)
+    result = json.loads(json_format.MessageToJson(info))
+
+    if not result.get("basicInfo"):
+        return None
+
+    is_banned = bool(result.get("isBanned", False))
+    result["ban_status"] = "🔴 BANNED" if is_banned else "🟢 UNBANNED"
+    result["region"] = actual_region
+    return result
+
+async def get_account(uid: int, prefer_region: Optional[str] = None) -> Optional[dict]:
+    """Race regions; first success wins. `prefer_region` gets a head start."""
+    order = list(REGION_PRIORITY)
+    if prefer_region and prefer_region in order:
+        order.remove(prefer_region)
+        order.insert(0, prefer_region)
+
+    tasks = [asyncio.create_task(_call_player_show(uid, r)) for r in order]
+
+    try:
+        for coro in asyncio.as_completed(tasks, timeout=25):
+            try:
+                data = await coro
+            except Exception:
+                continue
+            if data:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                return data
+    except asyncio.TimeoutError:
+        pass
+    finally:
         for t in tasks:
             if not t.done():
                 t.cancel()
-        return None
+    return None
 
+# ============= Lookups =============
+def get_item_name(item_id) -> str:
+    if not item_id or item_id in ("0", 0):
+        return "N/A"
     try:
-        account_data = asyncio.run(try_all_regions_parallel())
-    except Exception as e:
-        print(f"❌ Global error: {e}")
-        account_data = None
+        import requests
+        r = requests.get(f"https://api.danger.workers.dev/item/{item_id}", timeout=3)
+        if r.status_code == 200:
+            return r.json().get("name", str(item_id))
+    except Exception:
+        pass
+    return str(item_id)
 
-    if not account_data:
-        return jsonify({"error": "Player not found"}), 404
+def get_rank_name(rp) -> str:
+    try:
+        rp = int(rp)
+    except Exception:
+        return "N/A"
+    tiers = [
+        (100, "Bronze II"), (200, "Bronze III"), (300, "Silver I"),
+        (400, "Silver II"), (500, "Silver III"), (600, "Gold I"),
+        (700, "Gold II"), (800, "Gold III"), (900, "Platinum I"),
+        (1000, "Platinum II"), (1100, "Platinum III"), (1200, "Diamond I"),
+        (1300, "Diamond II"), (1400, "Diamond III"), (1500, "Heroic"),
+        (2000, "Master"),
+    ]
+    if rp == 0:
+        return "Bronze I"
+    for threshold, name in tiers:
+        if rp < threshold:
+            return name
+    return "Grandmaster"
 
-    used_region = account_data.get("region", "Unknown")
+def ts_to_bst(ts) -> str:
+    try:
+        dt = datetime.fromtimestamp(int(ts)) + timedelta(hours=6)
+        return dt.strftime("%d %b %Y at %I:%M:%S %p") + " (BST)"
+    except Exception:
+        return "N/A"
 
-    basic = account_data.get("basicInfo", {})
-    clan = account_data.get("clanBasicInfo", {})
-    social = account_data.get("socialInfo", {})
-    pet = account_data.get("petInfo", {})
-    captain = account_data.get("captainBasicInfo", {})
-    credit = account_data.get("creditScoreInfo", {})
+# ============= Response shaper =============
+def build_response(uid: str, data: dict) -> dict:
+    basic   = data.get("basicInfo", {})
+    clan    = data.get("clanBasicInfo", {})
+    social  = data.get("socialInfo", {})
+    pet     = data.get("petInfo", {})
+    captain = data.get("captainBasicInfo", {})
+    credit  = data.get("creditScoreInfo", {})
 
     prime_level = "N/A"
-    try:
-        prime_data = basic.get("primeLevel")
-        if isinstance(prime_data, dict):
-            prime_level = prime_data.get("level", "N/A")
-        elif prime_data is not None:
-            prime_level = str(prime_data)
-    except:
-        prime_level = "N/A"
+    prime_data = basic.get("primeLevel")
+    if isinstance(prime_data, dict):
+        prime_level = prime_data.get("level", "N/A")
+    elif prime_data is not None:
+        prime_level = str(prime_data)
 
-    response = {
+    return {
         "status": "success",
-        "server_used": used_region,
-        "BanStatus": account_data.get("ban_status", "❓ UNKNOWN"),
+        "server_used": data.get("region", "Unknown"),
+        "BanStatus": data.get("ban_status", "❓ UNKNOWN"),
         "BasicInformation": {
             "PrimeLevel": prime_level,
             "Name": basic.get("nickname", "N/A"),
@@ -413,7 +308,7 @@ def get_full_info():
             "HonorScore": credit.get("creditScore", "N/A"),
             "CelebrityStatus": "Yes" if basic.get("showBrRank") else "No",
             "Title": get_item_name(basic.get("title", "0")),
-            "Signature": social.get("signature", "N/A")
+            "Signature": social.get("signature", "N/A"),
         },
         "ActivityInformation": {
             "MostRecentOB": basic.get("releaseVersion", "N/A"),
@@ -424,14 +319,14 @@ def get_full_info():
             "ShowBRRank": "True" if basic.get("showBrRank") else "False",
             "ShowCSRank": "True" if basic.get("showCsRank") else "False",
             "CreatedAt": ts_to_bst(basic.get("createAt", 0)),
-            "LastLogin": ts_to_bst(basic.get("lastLoginAt", 0))
+            "LastLogin": ts_to_bst(basic.get("lastLoginAt", 0)),
         },
         "GuildInformation": {
             "GuildName": clan.get("clanName", "No Guild"),
             "GuildID": clan.get("clanId", "N/A"),
             "GuildLevel": clan.get("clanLevel", "N/A"),
             "LiveMembers": clan.get("memberNum", "N/A"),
-            "MaxMembers": clan.get("capacity", "N/A")
+            "MaxMembers": clan.get("capacity", "N/A"),
         },
         "PetDetails": {
             "Equipped": "Yes" if pet.get("isSelected") else "No",
@@ -440,7 +335,7 @@ def get_full_info():
             "PetSkill": get_item_name(pet.get("selectedSkillId", "0")),
             "PetSkin": get_item_name(pet.get("skinId", "0")),
             "PetExp": pet.get("exp", "N/A"),
-            "PetLevel": pet.get("level", "N/A")
+            "PetLevel": pet.get("level", "N/A"),
         },
         "LeaderInformation": {
             "Name": captain.get("nickname", "N/A"),
@@ -454,34 +349,88 @@ def get_full_info():
             "Title": get_item_name(captain.get("title", "0")),
             "BpBadges": captain.get("badgeCnt", "N/A"),
             "BRRank": get_rank_name(captain.get("rankingPoints", 0)),
-            "BRPoints": captain.get("rankingPoints", 0)
-        }
+            "BRPoints": captain.get("rankingPoints", 0),
+        },
     }
 
-    return jsonify(response)
+# ============= Routes =============
+@app.route("/info")
+def route_info():
+    uid = request.args.get("uid")
+    prefer = request.args.get("region", "").upper() or None
 
-@app.route('/')
-def home():
+    if not uid:
+        return jsonify({"success": False, "status": "error", "error": "UID required"}), 400
+
+    try:
+        uid_int = int(uid)
+    except ValueError:
+        return jsonify({"success": False, "status": "error", "error": "Invalid UID"}), 400
+
+    t0 = time.time()
+    try:
+        data = asyncio.run(get_account(uid_int, prefer_region=prefer))
+    except Exception as e:
+        log.exception("Unhandled error for UID %s", uid)
+        return jsonify({"success": False, "status": "error", "error": str(e)}), 500
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "status": "error",
+            "error": "Player not found on any region",
+            "uid": uid,
+            "elapsed_ms": elapsed_ms,
+        }), 404
+
+    resp = build_response(uid, data)
+    resp["elapsed_ms"] = elapsed_ms
+    return jsonify(resp)
+
+@app.route("/")
+def route_home():
     return jsonify({
         "status": "running",
-        "version": "OB55",
-        "endpoint": "/info?uid=UID",
+        "version": RELEASEVERSION,
+        "auth": "JWT",
+        "endpoint": "/info?uid=UID[&region=BD|IND|BR]",
         "example": "/info?uid=2084018498",
-        "priority": "BD → IND → BR",
-        "credit": "@NAJMI_ADMIN_2"
+        "priority": " → ".join(REGION_PRIORITY),
+        "uptime_s": int(time.time() - START_TIME),
+        "credit": "@NAJMI_ADMIN_2",
     })
 
-@app.route('/status')
-def token_status():
-    status = {}
+@app.route("/status")
+def route_status():
+    now = time.time()
+    tokens = {}
     for region, info in _token_cache.items():
-        expires_in = info['expires_at'] - time.time()
-        status[region] = {"has_token": True, "expires_in": f"{expires_in/3600:.1f} hours"}
-    return jsonify({"total_tokens": len(_token_cache), "tokens": status})
+        tokens[region] = {
+            "region": info["region"],
+            "expires_in_hours": round((info["expires_at"] - now) / 3600, 2),
+            "expired": info["expires_at"] <= now,
+        }
+    return jsonify({
+        "cached_tokens": len(tokens),
+        "tokens": tokens,
+        "uptime_s": int(now - START_TIME),
+    })
 
-# =============================================
-# Local dev entry point
-# =============================================
+@app.route("/health")
+def route_health():
+    return jsonify({"ok": True, "uptime_s": int(time.time() - START_TIME)}), 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5004, debug=False)
+@app.errorhandler(404)
+def handle_404(_):
+    return jsonify({"success": False, "error": "route not found"}), 404
+
+@app.errorhandler(405)
+def handle_405(_):
+    return jsonify({"success": False, "error": "method not allowed"}), 405
+
+# ============= Entry =============
+if __name__ == "__main__":
+    log.info("Starting FF API — version %s, JWT auth only", RELEASEVERSION)
+    app.run(host="0.0.0.0", port=5004, debug=False, threaded=True)
