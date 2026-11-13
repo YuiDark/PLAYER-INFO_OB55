@@ -41,8 +41,8 @@ JWT_API_BASE = "https://najmiob55jwttokengen.vercel.app/token"   #JWT API BY JAH
 # =============================================
 
 BD_CREDS = {
-    "uid": "7742406516", 
-    "password": "507D3250C779A4E73A74B66998E99DD4ED95A6133A07151FC0411A225C405ADD"
+    "uid": "8443537397", 
+    "password": "Dark_8558DC24CD8D"
 }
 
 IND_CREDS = {
